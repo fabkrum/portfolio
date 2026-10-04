@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# "Use this template" copies this workflow into every participant's repo. Its
+# jobs test the template, not their site: there the tests fail once the site
+# differs from the sample, and GitHub emails them "Run failed". So every job
+# runs in the template only.
+jobs:
+  test:
+    if: github.repository == 'fabkrum/portfolio-template'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install check-jsonschema
+      # Includes the Check against the sample site, against every checkpoint
+      # (applied to a fresh copy, with the sample content and with a
+      # participant's own) and against every broken fixture site, in the
+      # runner's own Chrome.
+      - name: Tests (renderer, Check and checkpoints)
+        run: node --test
+      - name: Content file matches the schema
+        shell: bash
+        run: bash tests/validate-content.sh
+      - name: The Check on the sample site, as a participant sees it
+        run: node tools/check.mjs
+      # The one documented action, run the way a participant runs it: from the
+      # repo folder, in the runner's default shell (PowerShell on Windows).
+      - name: Jump to the Lawyer's checkpoint, as a participant does
+        run: node tools/checkpoint.mjs lawyer
+      # The Check never fails by itself, so this step looks for its verdict.
+      - name: The Check on the Lawyer's checkpoint passes every item, as a participant sees it
+        shell: bash
+        run: |
+          node tools/check.mjs | tee checkpoint-check.log
+          grep -q "5 of 5 items pass" checkpoint-check.log
+
+  lint-install:
+    if: github.repository == 'fabkrum/portfolio-template'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck install.sh tests/install/*.sh
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $findings = Get-ChildItem install.ps1, tests/install/*.ps1 | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Settings tests/install/PSScriptAnalyzerSettings.psd1 }
+          $findings | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
+          if ($findings) { exit 1 }
+
+  # The runners ship Git, Node and Chrome. Each job first takes away what a
+  # fresh laptop would not have, then runs the one line exactly as the guide
+  # shows it, fetched from this commit, and runs it again afterwards.
+  install-linux:
+    if: github.repository == 'fabkrum/portfolio-template'
+    runs-on: ubuntu-latest
+    env:
+      INSTALL_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.sh
+      PORTFOLIO_GITHUB_USER: ${{ github.repository_owner }}
+      PORTFOLIO_REPO: ${{ github.event.repository.name }}
+      ORIGIN: https://github.com/${{ github.repository }}.git
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: under-test
+      - name: "Make it a fresh laptop: no Git, Ubuntu's own Node 18 (too old), no Chrome"
+        run: |
+          # git-man goes too: the runner's newer one from the Git PPA would block Ubuntu's own git.
+          sudo apt-get purge -y git git-man
+          sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx
+          sudo apt-get install -y nodejs
+          for name in google-chrome google-chrome-stable chromium chromium-browser; do
+            if path=$(command -v "$name"); then sudo mv "$path" "$path.hidden"; echo "$path" >> "$RUNNER_TEMP/hidden-chrome"; fi
+          done
+          if command -v git; then echo "Git is still there"; exit 1; fi
+          node --version
+      - name: First run
+        run: wget -qO- "$INSTALL_URL" | sh 2>&1 | tee "$RUNNER_TEMP/first-run.log"
+      - name: First run told the participant what is missing
+        run: >
+          bash under-test/tests/install/assert-said.sh "$RUNNER_TEMP/first-run.log"
+          "Google Chrome is not installed" "Antigravity IDE is not installed"
+          "open a new terminal window" "Run this command again any time"
+      - name: Chrome comes back (the participant installed it)
+        run: while read -r path; do sudo mv "$path.hidden" "$path"; done < "$RUNNER_TEMP/hidden-chrome"
+      - name: Ready after the first run
+        run: bash under-test/tests/install/assert-ready.sh "$HOME/$PORTFOLIO_REPO" "$ORIGIN"
+      # This time nothing answers the question up front: the participant types
+      # (here: pastes their repo link) into a real terminal.
+      - name: Second run, answering the question in a terminal
+        run: >
+          printf '%s\n' "https://github.com/$PORTFOLIO_GITHUB_USER/$PORTFOLIO_REPO"
+          | env -u PORTFOLIO_GITHUB_USER -u PORTFOLIO_REPO script -qec 'wget -qO- "$INSTALL_URL" | sh' /dev/null
+          | tee "$RUNNER_TEMP/second-run.log"
+      - name: Second run asked, then found everything in place
+        run: >
+          bash under-test/tests/install/assert-said.sh "$RUNNER_TEMP/second-run.log"
+          "What is your GitHub username?" "Your repo is already in" "Run this command again any time"
+      - name: Still ready after the second run
+        run: bash under-test/tests/install/assert-ready.sh "$HOME/$PORTFOLIO_REPO" "$ORIGIN"
+
+  install-macos:
+    if: github.repository == 'fabkrum/portfolio-template'
+    runs-on: macos-latest
+    env:
+      INSTALL_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.sh
+      PORTFOLIO_GITHUB_USER: ${{ github.repository_owner }}
+      PORTFOLIO_REPO: ${{ github.event.repository.name }}
+      ORIGIN: https://github.com/${{ github.repository }}.git
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: under-test
+      # On a fresh Mac, /usr/bin/git is only a stub that fails until the
+      # command line developer tools are installed. /usr/bin is protected on
+      # the runner, so a stub placed first on PATH plays that part.
+      - name: "Make it a fresh laptop: Git is only the stub, no Node"
+        run: |
+          mkdir -p "$RUNNER_TEMP/fresh-mac"
+          printf '%s\n' '#!/bin/sh' 'echo "xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools), missing xcrun" >&2' 'exit 1' > "$RUNNER_TEMP/fresh-mac/git"
+          chmod +x "$RUNNER_TEMP/fresh-mac/git"
+          for _ in 1 2 3 4 5; do
+            path=$(command -v node) || break
+            sudo rm -f "$path"
+            hash -r
+          done
+          if command -v node; then echo "Node is still there"; exit 1; fi
+      - name: First run (Git missing)
+        run: curl -fsSL "$INSTALL_URL" | PATH="$RUNNER_TEMP/fresh-mac:$PATH" sh 2>&1 | tee "$RUNNER_TEMP/first-run.log"
+      - name: First run told the participant what is missing
+        run: >
+          bash under-test/tests/install/assert-said.sh "$RUNNER_TEMP/first-run.log"
+          "command line developer tools" "Antigravity IDE is not installed"
+          "open a new terminal window" "Run this command again any time"
+      - name: Downloaded without Git after the first run
+        run: bash under-test/tests/install/assert-ready.sh "$HOME/$PORTFOLIO_REPO" "$ORIGIN" --without-git
+      - name: Second run (developer tools now installed)
+        run: curl -fsSL "$INSTALL_URL" | sh 2>&1 | tee "$RUNNER_TEMP/second-run.log"
+      - name: Second run connected the download to Git
+        run: >
+          bash under-test/tests/install/assert-said.sh "$RUNNER_TEMP/second-run.log"
+          "Connected your repo folder to Git" "Run this command again any time"
+      - name: Ready after the second run
+        run: bash under-test/tests/install/assert-ready.sh "$HOME/$PORTFOLIO_REPO" "$ORIGIN"
+
+  # Two Windows laptops: one with winget (most Windows 10 and 11), one without
+  # it, where the script falls back to downloads and connects Git later.
+  install-windows:
+    if: github.repository == 'fabkrum/portfolio-template'
+    strategy:
+      fail-fast: false
+      matrix:
+        winget: [present, missing]
+    runs-on: windows-latest
+    env:
+      INSTALL_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.ps1
+      PORTFOLIO_GITHUB_USER: ${{ github.repository_owner }}
+      PORTFOLIO_REPO: ${{ github.event.repository.name }}
+      ORIGIN: https://github.com/${{ github.repository }}.git
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: under-test
+      - name: "Make it a fresh laptop: no Git, no Node"
+        run: |
+          Start-Process "$env:ProgramFiles\Git\unins000.exe" -ArgumentList '/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES' -Wait
+          $uninstallKeys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          Get-ItemProperty $uninstallKeys | Where-Object { $_.DisplayName -like 'Node.js*' } | ForEach-Object {
+            Start-Process msiexec.exe -ArgumentList '/x', $_.PSChildName, '/qn', '/norestart' -Wait
+          }
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          foreach ($tool in 'git', 'node') {
+            if (Get-Command $tool -ErrorAction SilentlyContinue) { Write-Output "$tool is still there"; exit 1 }
+          }
+      # A winget that always fails, first on PATH, plays the laptop without it.
+      - name: "Without winget: hide it for the first run"
+        if: matrix.winget == 'missing'
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\no-winget" | Out-Null
+          Set-Content "$env:RUNNER_TEMP\no-winget\winget.cmd" '@exit /b 1'
+      - name: First run, in Windows PowerShell with the default execution policy
+        run: |
+          if ('${{ matrix.winget }}' -eq 'missing') { $env:Path = "$env:RUNNER_TEMP\no-winget;$env:Path" }
+          powershell.exe -NoProfile -ExecutionPolicy Restricted -Command "irm $env:INSTALL_URL | iex" *>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\first-run.log"
+      - name: First run told the participant what is missing
+        run: under-test/tests/install/assert-said.ps1 -Log "$env:RUNNER_TEMP\first-run.log" -Message 'Antigravity IDE is not installed', 'open a new terminal window', 'Run this command again any time'
+      - name: "With winget: ready after the first run"
+        if: matrix.winget == 'present'
+        run: under-test/tests/install/assert-ready.ps1 -RepoDir "$HOME\$env:PORTFOLIO_REPO" -Origin $env:ORIGIN
+      - name: "Without winget: told about Git, downloaded the repo, Node from nodejs.org"
+        if: matrix.winget == 'missing'
+        run: |
+          under-test/tests/install/assert-said.ps1 -Log "$env:RUNNER_TEMP\first-run.log" -Message 'Git could not be installed', 'Downloading Node from nodejs.org'
+          under-test/tests/install/assert-ready.ps1 -RepoDir "$HOME\$env:PORTFOLIO_REPO" -Origin $env:ORIGIN -WithoutGit
+      - name: Second run (winget available again in the missing case)
+        run: powershell.exe -NoProfile -ExecutionPolicy Restricted -Command "irm $env:INSTALL_URL | iex" *>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\second-run.log"
+      - name: Second run found the repo in place, or connected the download to Git
+        run: |
+          $expected = if ('${{ matrix.winget }}' -eq 'missing') { 'Connected your repo folder to Git' } else { 'Your repo is already in' }
+          under-test/tests/install/assert-said.ps1 -Log "$env:RUNNER_TEMP\second-run.log" -Message $expected, 'Run this command again any time'
+      - name: Ready after the second run
+        run: under-test/tests/install/assert-ready.ps1 -RepoDir "$HOME\$env:PORTFOLIO_REPO" -Origin $env:ORIGIN
